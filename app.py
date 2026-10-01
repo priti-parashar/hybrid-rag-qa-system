@@ -41,8 +41,8 @@ def load_models():
 
     generator = pipeline(
         task="text2text-generation",
-        model="google/flan-t5-small",
-        tokenizer="google/flan-t5-small",
+        model="google/flan-t5-base",
+        tokenizer="google/flan-t5-base",
         device=-1,
     )
 
@@ -111,10 +111,7 @@ def chunk_text(
         if chunk:
             chunks.append(chunk)
 
-        if (
-            start + words_per_chunk
-            >= len(words)
-        ):
+        if start + words_per_chunk >= len(words):
             break
 
     return chunks
@@ -232,12 +229,10 @@ def retrieve_chunks(
     )
 
     bm25_scores = np.asarray(
-        bm25.get_scores(
-            query_tokens
-        )
+        bm25.get_scores(query_tokens)
     )
 
-    # Normalize
+    # Normalize both scores
     semantic_normalized = normalize_scores(
         semantic_scores
     )
@@ -246,7 +241,7 @@ def retrieve_chunks(
         bm25_scores
     )
 
-    # Hybrid retrieval score
+    # Hybrid score
     hybrid_scores = (
         0.6 * semantic_normalized
         + 0.4 * bm25_normalized
@@ -279,9 +274,7 @@ def retrieve_chunks(
     )[::-1]
 
     final_indices = [
-        int(
-            candidate_indices[position]
-        )
+        int(candidate_indices[position])
         for position
         in reranked_positions[:top_k]
     ]
@@ -291,15 +284,7 @@ def retrieve_chunks(
         for index in final_indices
     ]
 
-    final_scores = [
-        float(
-            rerank_scores[position]
-        )
-        for position
-        in reranked_positions[:top_k]
-    ]
-
-    return final_chunks, final_scores
+    return final_chunks
 
 
 # --------------------------------------------------
@@ -324,19 +309,21 @@ def build_context(
         if remaining <= 0:
             break
 
+        selected_text = chunk[:remaining]
+
         selected.append(
-            chunk[:remaining]
+            selected_text
         )
 
         current_length += len(
-            selected[-1]
+            selected_text
         )
 
     return "\n\n".join(selected)
 
 
 # --------------------------------------------------
-# GENERATE GROUNDED ANSWER
+# GENERATE ANSWER
 # --------------------------------------------------
 
 def generate_answer(
@@ -350,15 +337,18 @@ def generate_answer(
     )
 
     prompt = f"""
-Answer the question using only the context below.
-
-If the context does not contain enough information
-to answer the question, say exactly:
-I couldn't find enough information in the document.
+Answer the question using only the information
+provided in the context.
 
 Do not use outside knowledge.
 Do not invent information.
-Give a concise and clear answer.
+
+If the answer cannot be found in the context,
+say exactly:
+
+I couldn't find enough information in the document.
+
+Give a short, clear and direct answer.
 
 Context:
 {context}
@@ -384,7 +374,7 @@ Answer:
 
 
 # --------------------------------------------------
-# USER INTERFACE
+# STREAMLIT UI
 # --------------------------------------------------
 
 uploaded_file = st.file_uploader(
@@ -422,23 +412,21 @@ if uploaded_file is not None:
         if not chunks:
 
             st.error(
-                "No readable text was found "
-                "in this PDF. The PDF may "
-                "be scanned or image-only."
+                "No readable text was found in this PDF. "
+                "The PDF may be scanned or image-only."
             )
 
             st.stop()
 
         st.success(
-            f"Ready! Extracted "
-            f"{len(chunks)} chunks."
+            f"Ready! Extracted {len(chunks)} chunks."
         )
 
     except Exception as error:
 
         st.error(
-            "Something went wrong while "
-            f"processing the PDF: {error}"
+            f"Something went wrong while processing "
+            f"the PDF: {error}"
         )
 
         st.stop()
@@ -457,10 +445,7 @@ if uploaded_file is not None:
                 "Searching the document..."
             ):
 
-                (
-                    retrieved_chunks,
-                    rerank_scores,
-                ) = retrieve_chunks(
+                retrieved_chunks = retrieve_chunks(
                     query,
                     chunks,
                     embeddings,
@@ -513,6 +498,6 @@ if uploaded_file is not None:
         except Exception as error:
 
             st.error(
-                "Something went wrong while "
-                f"answering: {error}"
+                f"Something went wrong while answering: "
+                f"{error}"
             )
