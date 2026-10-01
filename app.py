@@ -123,10 +123,7 @@ def chunk_text(
         if chunk:
             chunks.append(chunk)
 
-        if (
-            start + words_per_chunk
-            >= len(words)
-        ):
+        if start + words_per_chunk >= len(words):
             break
 
     return chunks
@@ -225,7 +222,6 @@ def retrieve_chunks(
     top_k=4,
 ):
 
-    # Semantic search
     query_embedding = embedding_model.encode(
         query,
         convert_to_numpy=True,
@@ -237,7 +233,6 @@ def retrieve_chunks(
         embeddings,
     )[0].cpu().numpy()
 
-    # BM25 search
     query_tokens = re.findall(
         r"\b\w+\b",
         query.lower(),
@@ -257,7 +252,6 @@ def retrieve_chunks(
         bm25_scores
     )
 
-    # Hybrid retrieval score
     hybrid_scores = (
         0.6 * semantic_normalized
         + 0.4 * bm25_normalized
@@ -272,7 +266,6 @@ def retrieve_chunks(
         hybrid_scores
     )[-candidate_count:][::-1]
 
-    # CrossEncoder reranking
     pairs = [
         (
             query,
@@ -339,7 +332,7 @@ def build_context(
 
 
 # --------------------------------------------------
-# GENERATE ANSWER WITH FALLBACK
+# GENERATE ANSWER
 # --------------------------------------------------
 
 def generate_answer(
@@ -378,7 +371,6 @@ USER QUESTION:
 ANSWER:
 """.strip()
 
-    # Stable Gemini models used as fallbacks
     models = [
         "gemini-3.8-flash",
         "gemini-3.7-flash",
@@ -390,7 +382,6 @@ ANSWER:
 
     for model_name in models:
 
-        # Two attempts per model
         for attempt in range(2):
 
             try:
@@ -409,7 +400,6 @@ ANSWER:
 
                 error_text = str(error).lower()
 
-                # Retry/fallback only for temporary API problems
                 temporary_error = any(
                     item in error_text
                     for item in [
@@ -425,21 +415,27 @@ ANSWER:
                 if not temporary_error:
                     raise
 
-                # Short wait before retry
                 if attempt == 0:
                     time.sleep(2)
 
-        # If both attempts fail,
-        # automatically try the next model.
-
     raise RuntimeError(
-        "Gemini is temporarily unavailable. "
-        "Please try again shortly."
+        "Gemini is temporarily unavailable."
     ) from last_error
 
 
 # --------------------------------------------------
-# STREAMLIT UI
+# CHAT HISTORY
+# --------------------------------------------------
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "current_pdf" not in st.session_state:
+    st.session_state.current_pdf = None
+
+
+# --------------------------------------------------
+# PDF UPLOAD
 # --------------------------------------------------
 
 uploaded_file = st.file_uploader(
@@ -450,9 +446,27 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file is not None:
 
-    try:
+    file_bytes = uploaded_file.getvalue()
 
-        file_bytes = uploaded_file.getvalue()
+    # If a different PDF is uploaded,
+    # start a fresh conversation.
+    pdf_identifier = (
+        uploaded_file.name,
+        len(file_bytes),
+    )
+
+    if (
+        st.session_state.current_pdf
+        != pdf_identifier
+    ):
+
+        st.session_state.current_pdf = (
+            pdf_identifier
+        )
+
+        st.session_state.messages = []
+
+    try:
 
         with st.spinner(
             "Processing PDF..."
@@ -494,71 +508,130 @@ if uploaded_file is not None:
         st.stop()
 
 
-    question = st.text_input(
-        "Ask a question about the PDF:"
+    # --------------------------------------------------
+    # DISPLAY PREVIOUS CHAT
+    # --------------------------------------------------
+
+    for message in st.session_state.messages:
+
+        with st.chat_message(
+            message["role"]
+        ):
+
+            st.write(
+                message["content"]
+            )
+
+            if (
+                message["role"] == "assistant"
+                and message.get("sources")
+            ):
+
+                with st.expander(
+                    "Show source context"
+                ):
+
+                    for number, chunk in enumerate(
+                        message["sources"],
+                        start=1,
+                    ):
+
+                        st.markdown(
+                            f"**Source {number}**"
+                        )
+
+                        st.write(chunk)
+
+                        if number < len(
+                            message["sources"]
+                        ):
+                            st.divider()
+
+
+    # --------------------------------------------------
+    # NEW QUESTION
+    # --------------------------------------------------
+
+    question = st.chat_input(
+        "Ask a question about the PDF"
     )
 
 
     if question:
 
-        try:
+        # Save user's question
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": question,
+            }
+        )
 
-            with st.spinner(
-                "Searching the document..."
-            ):
-
-                retrieved_chunks = retrieve_chunks(
-                    question,
-                    chunks,
-                    embeddings,
-                    bm25,
-                    embedding_model,
-                    reranker,
-                )
-
-                answer = generate_answer(
-                    question,
-                    retrieved_chunks,
-                )
+        with st.chat_message("user"):
+            st.write(question)
 
 
-            # --------------------------------------
-            # ANSWER
-            # --------------------------------------
+        # Generate answer
+        with st.chat_message("assistant"):
 
-            st.subheader("Answer")
+            try:
 
-            st.write(answer)
-
-
-            # --------------------------------------
-            # SOURCE CONTEXT
-            # --------------------------------------
-
-            with st.expander(
-                "Show source context"
-            ):
-
-                for number, chunk in enumerate(
-                    retrieved_chunks,
-                    start=1,
+                with st.spinner(
+                    "Searching the document..."
                 ):
 
-                    st.markdown(
-                        f"**Source {number}**"
+                    retrieved_chunks = retrieve_chunks(
+                        question,
+                        chunks,
+                        embeddings,
+                        bm25,
+                        embedding_model,
+                        reranker,
                     )
 
-                    st.write(chunk)
+                    answer = generate_answer(
+                        question,
+                        retrieved_chunks,
+                    )
 
-                    if number < len(
-                        retrieved_chunks
+                st.write(answer)
+
+                with st.expander(
+                    "Show source context"
+                ):
+
+                    for number, chunk in enumerate(
+                        retrieved_chunks,
+                        start=1,
                     ):
-                        st.divider()
+
+                        st.markdown(
+                            f"**Source {number}**"
+                        )
+
+                        st.write(chunk)
+
+                        if number < len(
+                            retrieved_chunks
+                        ):
+                            st.divider()
 
 
-        except Exception:
+                # Save assistant response
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": retrieved_chunks,
+                    }
+                )
 
-            st.error(
-                "The AI service is temporarily busy. "
-                "Please try your question again."
-            )
+
+            except Exception:
+
+                error_message = (
+                    "The AI service is temporarily busy. "
+                    "Please try your question again."
+                )
+
+                st.error(error_message)
