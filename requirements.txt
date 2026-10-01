@@ -4,4 +4,4 @@ numpy
 sentence-transformers==3.0.1
 rank-bm25
 transformers==4.44.2
-sentencepiece
+
