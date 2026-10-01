@@ -6,11 +6,14 @@ import pypdf
 import streamlit as st
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer, util
-from transformers import pipeline
+from transformers import (
+    AutoModelForQuestionAnswering,
+    AutoTokenizer,
+)
 
 
 # --------------------------------------------------
-# PAGE CONFIG
+# PAGE
 # --------------------------------------------------
 
 st.set_page_config(
@@ -20,7 +23,7 @@ st.set_page_config(
 
 st.title("📄 Hybrid RAG PDF Q&A")
 st.caption(
-    "Semantic Search + BM25 + CrossEncoder Reranking + FLAN-T5"
+    "Semantic Search + BM25 + CrossEncoder + Extractive QA"
 )
 
 
@@ -39,18 +42,31 @@ def load_models():
         "cross-encoder/ms-marco-MiniLM-L-6-v2"
     )
 
-    generator = pipeline(
-        task="text2text-generation",
-        model="google/flan-t5-base",
-        tokenizer="google/flan-t5-base",
-        device=-1,
+    qa_model_name = (
+        "distilbert/"
+        "distilbert-base-uncased-distilled-squad"
     )
 
-    return embedding_model, reranker, generator
+    qa_tokenizer = AutoTokenizer.from_pretrained(
+        qa_model_name
+    )
+
+    qa_model = AutoModelForQuestionAnswering.from_pretrained(
+        qa_model_name
+    )
+
+    qa_model.eval()
+
+    return (
+        embedding_model,
+        reranker,
+        qa_tokenizer,
+        qa_model,
+    )
 
 
 # --------------------------------------------------
-# CLEAN TEXT
+# CLEAN PDF TEXT
 # --------------------------------------------------
 
 def clean_text(text):
@@ -73,13 +89,13 @@ def clean_text(text):
 
 
 # --------------------------------------------------
-# CHUNK TEXT
+# CHUNKING
 # --------------------------------------------------
 
 def chunk_text(
     text,
-    words_per_chunk=160,
-    overlap=40,
+    words_per_chunk=140,
+    overlap=35,
 ):
 
     words = text.split()
@@ -111,7 +127,10 @@ def chunk_text(
         if chunk:
             chunks.append(chunk)
 
-        if start + words_per_chunk >= len(words):
+        if (
+            start + words_per_chunk
+            >= len(words)
+        ):
             break
 
     return chunks
@@ -137,16 +156,25 @@ def process_pdf(file_bytes):
         if page_text:
             pages.append(page_text)
 
-    text = "\n\n".join(pages)
+    full_text = "\n\n".join(pages)
 
-    text = clean_text(text)
+    full_text = clean_text(
+        full_text
+    )
 
-    chunks = chunk_text(text)
+    chunks = chunk_text(
+        full_text
+    )
 
     if not chunks:
         return [], np.array([]), None
 
-    embedding_model, _, _ = load_models()
+    (
+        embedding_model,
+        _,
+        _,
+        _,
+    ) = load_models()
 
     embeddings = embedding_model.encode(
         chunks,
@@ -166,7 +194,11 @@ def process_pdf(file_bytes):
         tokenized_chunks
     )
 
-    return chunks, embeddings, bm25
+    return (
+        chunks,
+        embeddings,
+        bm25,
+    )
 
 
 # --------------------------------------------------
@@ -207,7 +239,7 @@ def retrieve_chunks(
     bm25,
     embedding_model,
     reranker,
-    top_k=3,
+    top_k=5,
 ):
 
     # Semantic search
@@ -229,22 +261,23 @@ def retrieve_chunks(
     )
 
     bm25_scores = np.asarray(
-        bm25.get_scores(query_tokens)
+        bm25.get_scores(
+            query_tokens
+        )
     )
 
-    # Normalize both scores
-    semantic_normalized = normalize_scores(
+    semantic_scores = normalize_scores(
         semantic_scores
     )
 
-    bm25_normalized = normalize_scores(
+    bm25_scores = normalize_scores(
         bm25_scores
     )
 
-    # Hybrid score
+    # Hybrid retrieval
     hybrid_scores = (
-        0.6 * semantic_normalized
-        + 0.4 * bm25_normalized
+        0.6 * semantic_scores
+        + 0.4 * bm25_scores
     )
 
     candidate_count = min(
@@ -266,7 +299,9 @@ def retrieve_chunks(
     ]
 
     rerank_scores = np.asarray(
-        reranker.predict(pairs)
+        reranker.predict(
+            pairs
+        )
     )
 
     reranked_positions = np.argsort(
@@ -274,107 +309,175 @@ def retrieve_chunks(
     )[::-1]
 
     final_indices = [
-        int(candidate_indices[position])
+        int(
+            candidate_indices[position]
+        )
         for position
         in reranked_positions[:top_k]
     ]
 
-    final_chunks = [
+    return [
         chunks[index]
         for index in final_indices
     ]
 
-    return final_chunks
-
 
 # --------------------------------------------------
-# BUILD CONTEXT
+# EXTRACT ANSWER FROM ONE CHUNK
 # --------------------------------------------------
 
-def build_context(
-    retrieved_chunks,
-    max_characters=1800,
+def answer_from_chunk(
+    question,
+    context,
+    tokenizer,
+    model,
 ):
 
-    selected = []
-    current_length = 0
+    import torch
+
+    inputs = tokenizer(
+        question,
+        context,
+        return_tensors="pt",
+        truncation="only_second",
+        max_length=512,
+    )
+
+    with torch.no_grad():
+
+        outputs = model(
+            **inputs
+        )
+
+    start_logits = (
+        outputs.start_logits[0]
+    )
+
+    end_logits = (
+        outputs.end_logits[0]
+    )
+
+    sequence_ids = inputs.sequence_ids(
+        0
+    )
+
+    context_positions = [
+        index
+        for index, sequence_id
+        in enumerate(sequence_ids)
+        if sequence_id == 1
+    ]
+
+    if not context_positions:
+        return "", 0.0
+
+    best_answer = ""
+    best_score = float("-inf")
+
+    # Search possible answer spans only
+    # inside the document context.
+    for start_index in context_positions:
+
+        max_end = min(
+            start_index + 30,
+            context_positions[-1] + 1,
+        )
+
+        for end_index in range(
+            start_index,
+            max_end,
+        ):
+
+            if sequence_ids[
+                end_index
+            ] != 1:
+                continue
+
+            score = float(
+                start_logits[start_index]
+                + end_logits[end_index]
+            )
+
+            if score > best_score:
+
+                token_ids = inputs[
+                    "input_ids"
+                ][0][
+                    start_index:
+                    end_index + 1
+                ]
+
+                answer = tokenizer.decode(
+                    token_ids,
+                    skip_special_tokens=True,
+                ).strip()
+
+                if answer:
+
+                    best_score = score
+                    best_answer = answer
+
+    return (
+        best_answer,
+        best_score,
+    )
+
+
+# --------------------------------------------------
+# FIND BEST ANSWER ACROSS RETRIEVED CHUNKS
+# --------------------------------------------------
+
+def find_best_answer(
+    question,
+    retrieved_chunks,
+    tokenizer,
+    model,
+):
+
+    answers = []
 
     for chunk in retrieved_chunks:
 
-        remaining = (
-            max_characters
-            - current_length
+        answer, score = answer_from_chunk(
+            question,
+            chunk,
+            tokenizer,
+            model,
         )
 
-        if remaining <= 0:
-            break
+        if answer:
 
-        selected_text = chunk[:remaining]
+            answers.append(
+                (
+                    answer,
+                    score,
+                    chunk,
+                )
+            )
 
-        selected.append(
-            selected_text
+    if not answers:
+
+        return (
+            None,
+            None,
         )
 
-        current_length += len(
-            selected_text
-        )
-
-    return "\n\n".join(selected)
-
-
-# --------------------------------------------------
-# GENERATE ANSWER
-# --------------------------------------------------
-
-def generate_answer(
-    query,
-    retrieved_chunks,
-    generator,
-):
-
-    context = build_context(
-        retrieved_chunks
+    answers.sort(
+        key=lambda item: item[1],
+        reverse=True,
     )
 
-    prompt = f"""
-Answer the question using only the information
-provided in the context.
+    best_answer = answers[0][0]
+    best_source = answers[0][2]
 
-Do not use outside knowledge.
-Do not invent information.
-
-If the answer cannot be found in the context,
-say exactly:
-
-I couldn't find enough information in the document.
-
-Give a short, clear and direct answer.
-
-Context:
-{context}
-
-Question:
-{query}
-
-Answer:
-""".strip()
-
-    result = generator(
-        prompt,
-        max_new_tokens=100,
-        do_sample=False,
-        truncation=True,
+    return (
+        best_answer,
+        best_source,
     )
-
-    answer = result[0][
-        "generated_text"
-    ].strip()
-
-    return answer
 
 
 # --------------------------------------------------
-# STREAMLIT UI
+# USER INTERFACE
 # --------------------------------------------------
 
 uploaded_file = st.file_uploader(
@@ -406,38 +509,41 @@ if uploaded_file is not None:
             (
                 embedding_model,
                 reranker,
-                generator,
+                qa_tokenizer,
+                qa_model,
             ) = load_models()
 
         if not chunks:
 
             st.error(
-                "No readable text was found in this PDF. "
-                "The PDF may be scanned or image-only."
+                "No readable text was found "
+                "in this PDF. It may be "
+                "scanned or image-only."
             )
 
             st.stop()
 
         st.success(
-            f"Ready! Extracted {len(chunks)} chunks."
+            f"Ready! Extracted "
+            f"{len(chunks)} chunks."
         )
 
     except Exception as error:
 
         st.error(
-            f"Something went wrong while processing "
-            f"the PDF: {error}"
+            "Something went wrong while "
+            f"processing the PDF: {error}"
         )
 
         st.stop()
 
 
-    query = st.text_input(
+    question = st.text_input(
         "Ask a question about the PDF:"
     )
 
 
-    if query:
+    if question:
 
         try:
 
@@ -446,7 +552,7 @@ if uploaded_file is not None:
             ):
 
                 retrieved_chunks = retrieve_chunks(
-                    query,
+                    question,
                     chunks,
                     embeddings,
                     bm25,
@@ -454,50 +560,76 @@ if uploaded_file is not None:
                     reranker,
                 )
 
-                answer = generate_answer(
-                    query,
+                (
+                    answer,
+                    answer_source,
+                ) = find_best_answer(
+                    question,
                     retrieved_chunks,
-                    generator,
+                    qa_tokenizer,
+                    qa_model,
                 )
 
 
-            # --------------------------------------
-            # ANSWER
-            # --------------------------------------
+            st.subheader(
+                "Answer"
+            )
 
-            st.subheader("Answer")
+            if answer:
 
-            st.write(answer)
+                st.write(
+                    answer
+                )
 
+            else:
 
-            # --------------------------------------
-            # SOURCE CONTEXT
-            # --------------------------------------
+                st.warning(
+                    "I couldn't find a reliable "
+                    "answer in the document."
+                )
+
 
             with st.expander(
                 "Show source context"
             ):
 
+                if answer_source:
+
+                    st.markdown(
+                        "**Answer source**"
+                    )
+
+                    st.write(
+                        answer_source
+                    )
+
+                    st.divider()
+
                 for number, chunk in enumerate(
-                    retrieved_chunks,
+                    retrieved_chunks[:3],
                     start=1,
                 ):
 
                     st.markdown(
-                        f"**Source {number}**"
+                        f"**Retrieved source "
+                        f"{number}**"
                     )
 
-                    st.write(chunk)
+                    st.write(
+                        chunk
+                    )
 
-                    if number < len(
-                        retrieved_chunks
+                    if number < min(
+                        3,
+                        len(retrieved_chunks),
                     ):
+
                         st.divider()
 
 
         except Exception as error:
 
             st.error(
-                f"Something went wrong while answering: "
-                f"{error}"
+                "Something went wrong while "
+                f"answering: {error}"
             )
