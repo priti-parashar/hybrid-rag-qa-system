@@ -1,5 +1,6 @@
 import io
 import re
+import time
 
 import numpy as np
 import pypdf
@@ -49,10 +50,14 @@ def load_models():
 @st.cache_resource
 def get_gemini_client():
 
-    api_key = st.secrets["GEMINI_API_KEY"]
+    if "GEMINI_API_KEY" not in st.secrets:
+        st.error(
+            "Gemini API key is missing from Streamlit Secrets."
+        )
+        st.stop()
 
     return genai.Client(
-        api_key=api_key
+        api_key=st.secrets["GEMINI_API_KEY"]
     )
 
 
@@ -220,7 +225,7 @@ def retrieve_chunks(
     top_k=4,
 ):
 
-    # Semantic retrieval
+    # Semantic search
     query_embedding = embedding_model.encode(
         query,
         convert_to_numpy=True,
@@ -232,7 +237,7 @@ def retrieve_chunks(
         embeddings,
     )[0].cpu().numpy()
 
-    # BM25 retrieval
+    # BM25 search
     query_tokens = re.findall(
         r"\b\w+\b",
         query.lower(),
@@ -252,7 +257,7 @@ def retrieve_chunks(
         bm25_scores
     )
 
-    # Hybrid score
+    # Hybrid retrieval score
     hybrid_scores = (
         0.6 * semantic_normalized
         + 0.4 * bm25_normalized
@@ -285,9 +290,7 @@ def retrieve_chunks(
     )[::-1]
 
     final_indices = [
-        int(
-            candidate_indices[position]
-        )
+        int(candidate_indices[position])
         for position
         in reranked_positions[:top_k]
     ]
@@ -336,7 +339,7 @@ def build_context(
 
 
 # --------------------------------------------------
-# GENERATE GROUNDED ANSWER
+# GENERATE ANSWER WITH FALLBACK
 # --------------------------------------------------
 
 def generate_answer(
@@ -361,9 +364,9 @@ Rules:
 - Do not invent facts.
 - Combine relevant information from the context when necessary.
 - Give a clear, natural and concise answer.
-- Do not simply copy an unrelated sentence from the context.
-- If the context genuinely does not contain enough information to
-  answer the question, reply exactly:
+- Do not simply copy an unrelated sentence.
+- If the document context does not contain enough information,
+  reply exactly:
   "I couldn't find enough information in the document."
 
 DOCUMENT CONTEXT:
@@ -375,18 +378,64 @@ USER QUESTION:
 ANSWER:
 """.strip()
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt,
-    )
+    # Stable Gemini models used as fallbacks
+    models = [
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+    ]
 
-    if not response.text:
-        return (
-            "I couldn't find enough information "
-            "in the document."
-        )
+    last_error = None
 
-    return response.text.strip()
+    for model_name in models:
+
+        # Two attempts per model
+        for attempt in range(2):
+
+            try:
+
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                )
+
+                if response.text:
+                    return response.text.strip()
+
+            except Exception as error:
+
+                last_error = error
+
+                error_text = str(error).lower()
+
+                # Retry/fallback only for temporary API problems
+                temporary_error = any(
+                    item in error_text
+                    for item in [
+                        "503",
+                        "unavailable",
+                        "high demand",
+                        "429",
+                        "resource_exhausted",
+                        "timeout",
+                    ]
+                )
+
+                if not temporary_error:
+                    raise
+
+                # Short wait before retry
+                if attempt == 0:
+                    time.sleep(2)
+
+        # If both attempts fail,
+        # automatically try the next model.
+
+    raise RuntimeError(
+        "Gemini is temporarily unavailable. "
+        "Please try again shortly."
+    ) from last_error
 
 
 # --------------------------------------------------
@@ -483,7 +532,7 @@ if uploaded_file is not None:
 
 
             # --------------------------------------
-            # SOURCES
+            # SOURCE CONTEXT
             # --------------------------------------
 
             with st.expander(
@@ -507,9 +556,9 @@ if uploaded_file is not None:
                         st.divider()
 
 
-        except Exception as error:
+        except Exception:
 
             st.error(
-                "Something went wrong while answering. "
-                f"Details: {error}"
+                "The AI service is temporarily busy. "
+                "Please try your question again."
             )
