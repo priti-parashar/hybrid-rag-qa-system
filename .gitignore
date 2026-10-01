@@ -1,5 +1,42 @@
-.venv/
+# Secrets / API keys
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*.pem
+*.key
+
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local/test files
+uploads/
+data/
+*.pdf
+*.log
+
+# Model/cache files
+.cache/
+huggingface/
+models/
 embeddings_cache.pkl
-.streamlit/
