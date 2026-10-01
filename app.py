@@ -17,9 +17,7 @@ st.set_page_config(
 )
 
 st.title("📄 Hybrid RAG PDF Q&A")
-st.caption(
-    "Semantic Search + BM25 + CrossEncoder Reranking"
-)
+st.caption("Semantic Search + BM25 + CrossEncoder Reranking")
 
 
 # --------------------------------------------------
@@ -67,18 +65,26 @@ def clean_text(text):
 # CHUNKING
 # --------------------------------------------------
 
-def chunk_text(text, words_per_chunk=180, overlap=40):
+def chunk_text(
+    text,
+    words_per_chunk=180,
+    overlap=40
+):
 
     words = text.split()
 
-    chunks = []
-
     if not words:
-        return chunks
+        return []
+
+    chunks = []
 
     step = words_per_chunk - overlap
 
-    for start in range(0, len(words), step):
+    for start in range(
+        0,
+        len(words),
+        step
+    ):
 
         chunk_words = words[
             start:start + words_per_chunk
@@ -87,12 +93,17 @@ def chunk_text(text, words_per_chunk=180, overlap=40):
         if not chunk_words:
             continue
 
-        chunk = " ".join(chunk_words).strip()
+        chunk = " ".join(
+            chunk_words
+        ).strip()
 
         if chunk:
             chunks.append(chunk)
 
-        if start + words_per_chunk >= len(words):
+        if (
+            start + words_per_chunk
+            >= len(words)
+        ):
             break
 
     return chunks
@@ -105,7 +116,9 @@ def chunk_text(text, words_per_chunk=180, overlap=40):
 @st.cache_data
 def process_pdf(file_bytes):
 
-    pdf = pypdf.PdfReader(file_bytes)
+    pdf = pypdf.PdfReader(
+        file_bytes
+    )
 
     pages = []
 
@@ -123,7 +136,6 @@ def process_pdf(file_bytes):
     chunks = chunk_text(text)
 
     if not chunks:
-
         return [], np.array([]), None
 
     embedding_model, _ = load_models()
@@ -135,12 +147,10 @@ def process_pdf(file_bytes):
     )
 
     tokenized_chunks = [
-
         re.findall(
             r"\b\w+\b",
             chunk.lower()
         )
-
         for chunk in chunks
     ]
 
@@ -152,7 +162,7 @@ def process_pdf(file_bytes):
 
 
 # --------------------------------------------------
-# NORMALIZATION
+# NORMALIZE SCORES
 # --------------------------------------------------
 
 def normalize_scores(scores):
@@ -166,7 +176,6 @@ def normalize_scores(scores):
     score_max = scores.max()
 
     if score_max == score_min:
-
         return np.zeros_like(
             scores,
             dtype=float
@@ -193,7 +202,7 @@ def retrieve_chunks(
     top_k=5
 ):
 
-    # Semantic retrieval
+    # Semantic search
     query_embedding = embedding_model.encode(
         query,
         convert_to_numpy=True,
@@ -205,19 +214,19 @@ def retrieve_chunks(
         embeddings
     )[0].cpu().numpy()
 
-
-    # BM25 retrieval
+    # BM25 search
     query_tokens = re.findall(
         r"\b\w+\b",
         query.lower()
     )
 
     bm25_scores = np.asarray(
-        bm25.get_scores(query_tokens)
+        bm25.get_scores(
+            query_tokens
+        )
     )
 
-
-    # Normalize both score types
+    # Normalize scores
     semantic_normalized = normalize_scores(
         semantic_scores
     )
@@ -226,13 +235,11 @@ def retrieve_chunks(
         bm25_scores
     )
 
-
     # Hybrid score
     hybrid_scores = (
         0.6 * semantic_normalized
         + 0.4 * bm25_normalized
     )
-
 
     candidate_count = min(
         10,
@@ -243,15 +250,12 @@ def retrieve_chunks(
         hybrid_scores
     )[-candidate_count:][::-1]
 
-
     # CrossEncoder reranking
     pairs = [
-
         (
             query,
             chunks[int(index)]
         )
-
         for index in candidate_indices
     ]
 
@@ -263,63 +267,267 @@ def retrieve_chunks(
         rerank_scores
     )[::-1]
 
-
     final_indices = [
-
         int(
             candidate_indices[position]
         )
-
-        for position in reranked_positions[:top_k]
+        for position
+        in reranked_positions[:top_k]
     ]
 
-
     final_chunks = [
-
         chunks[index]
-
         for index in final_indices
     ]
 
+    return final_chunks
 
-    final_scores = [
 
-        float(
-            rerank_scores[position]
+# --------------------------------------------------
+# EXTRACT SEARCH SUBJECT
+# --------------------------------------------------
+
+def extract_subject(query):
+
+    query_lower = query.lower().strip()
+
+    patterns = [
+        r"time complexity of (.+?)(?:\?|$)",
+        r"space complexity of (.+?)(?:\?|$)",
+        r"complexity of (.+?)(?:\?|$)",
+        r"what is (.+?)(?:\?|$)",
+        r"what are (.+?)(?:\?|$)",
+        r"define (.+?)(?:\?|$)",
+        r"explain (.+?)(?:\?|$)"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            query_lower
         )
 
-        for position in reranked_positions[:top_k]
-    ]
+        if match:
 
+            subject = match.group(1).strip()
 
-    return final_chunks, final_scores
+            subject = re.sub(
+                r"\bthe\b",
+                "",
+                subject
+            ).strip()
+
+            if subject:
+                return subject
+
+    return query_lower.rstrip("?")
 
 
 # --------------------------------------------------
-# SENTENCE EXTRACTION
+# COMPLEXITY ANSWER
 # --------------------------------------------------
 
-def split_into_sentences(text):
+def find_complexity_answer(
+    query,
+    retrieved_chunks
+):
 
-    # Split normal sentences while also handling
-    # PDF text that contains headings or short lines.
-    sentences = re.split(
-        r"(?<=[.!?])\s+|\n+",
-        text
+    query_lower = query.lower()
+
+    if not (
+        "complexity" in query_lower
+        or "big o" in query_lower
+        or "big-o" in query_lower
+    ):
+        return None
+
+    subject = extract_subject(query)
+
+    # Example:
+    # subject = "binary search"
+    subject_pattern = re.escape(subject)
+
+    # Look for:
+    # Binary search ... O(log n)
+    forward_pattern = re.compile(
+        rf"{subject_pattern}"
+        rf".{{0,100}}?"
+        rf"(O\s*\(\s*[^)]+\s*\))",
+        re.IGNORECASE
     )
 
-    return [
+    # Also handle:
+    # O(log n) ... binary search
+    backward_pattern = re.compile(
+        rf"(O\s*\(\s*[^)]+\s*\))"
+        rf".{{0,100}}?"
+        rf"{subject_pattern}",
+        re.IGNORECASE
+    )
 
-        sentence.strip()
+    for chunk in retrieved_chunks:
 
-        for sentence in sentences
+        forward_match = forward_pattern.search(
+            chunk
+        )
 
-        if sentence.strip()
-    ]
+        if forward_match:
+
+            complexity = forward_match.group(1)
+
+            complexity = re.sub(
+                r"\s+",
+                " ",
+                complexity
+            )
+
+            return (
+                f"The time complexity of "
+                f"{subject} is {complexity}."
+            )
+
+        backward_match = backward_pattern.search(
+            chunk
+        )
+
+        if backward_match:
+
+            complexity = backward_match.group(1)
+
+            complexity = re.sub(
+                r"\s+",
+                " ",
+                complexity
+            )
+
+            return (
+                f"The time complexity of "
+                f"{subject} is {complexity}."
+            )
+
+    return None
 
 
 # --------------------------------------------------
-# CREATE ANSWER FROM RETRIEVED CONTEXT
+# SPLIT CONTEXT INTO SMALL PASSAGES
+# --------------------------------------------------
+
+def make_passages(text):
+
+    # PDF extraction often removes punctuation/newlines.
+    # Therefore we create smaller overlapping word passages
+    # instead of relying only on sentence boundaries.
+
+    words = text.split()
+
+    passages = []
+
+    passage_size = 35
+    overlap = 10
+
+    step = passage_size - overlap
+
+    for start in range(
+        0,
+        len(words),
+        step
+    ):
+
+        passage_words = words[
+            start:start + passage_size
+        ]
+
+        if not passage_words:
+            continue
+
+        passage = " ".join(
+            passage_words
+        ).strip()
+
+        if passage:
+            passages.append(passage)
+
+        if (
+            start + passage_size
+            >= len(words)
+        ):
+            break
+
+    return passages
+
+
+# --------------------------------------------------
+# GENERAL ANSWER
+# --------------------------------------------------
+
+def find_general_answer(
+    query,
+    retrieved_chunks,
+    embedding_model
+):
+
+    passages = []
+
+    for chunk in retrieved_chunks:
+
+        passages.extend(
+            make_passages(chunk)
+        )
+
+    if not passages:
+        return None, 0.0
+
+    # Remove duplicate passages
+    unique_passages = []
+    seen = set()
+
+    for passage in passages:
+
+        key = passage.lower()
+
+        if key not in seen:
+
+            seen.add(key)
+
+            unique_passages.append(
+                passage
+            )
+
+    query_embedding = embedding_model.encode(
+        query,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+
+    passage_embeddings = embedding_model.encode(
+        unique_passages,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+
+    scores = util.cos_sim(
+        query_embedding,
+        passage_embeddings
+    )[0].cpu().numpy()
+
+    best_index = int(
+        np.argmax(scores)
+    )
+
+    best_score = float(
+        scores[best_index]
+    )
+
+    best_passage = unique_passages[
+        best_index
+    ]
+
+    return best_passage, best_score
+
+
+# --------------------------------------------------
+# CREATE FINAL ANSWER
 # --------------------------------------------------
 
 def create_answer(
@@ -328,153 +536,27 @@ def create_answer(
     embedding_model
 ):
 
-    sentences = []
-
-    for chunk in retrieved_chunks:
-
-        sentences.extend(
-            split_into_sentences(chunk)
-        )
-
-
-    # Remove duplicate sentences
-    unique_sentences = []
-
-    seen = set()
-
-    for sentence in sentences:
-
-        normalized = sentence.lower().strip()
-
-        if (
-            normalized
-            and normalized not in seen
-        ):
-
-            seen.add(normalized)
-
-            unique_sentences.append(
-                sentence
-            )
-
-
-    if not unique_sentences:
-
-        return None, 0.0
-
-
-    # Compare the question directly with
-    # sentences in the retrieved context.
-    query_embedding = embedding_model.encode(
+    # First handle complexity questions
+    complexity_answer = find_complexity_answer(
         query,
-        convert_to_numpy=True,
-        normalize_embeddings=True
+        retrieved_chunks
     )
 
-    sentence_embeddings = embedding_model.encode(
-        unique_sentences,
-        convert_to_numpy=True,
-        normalize_embeddings=True
-    )
+    if complexity_answer:
 
-    similarities = util.cos_sim(
-        query_embedding,
-        sentence_embeddings
-    )[0].cpu().numpy()
-
-
-    best_indices = np.argsort(
-        similarities
-    )[::-1]
-
-
-    best_index = int(
-        best_indices[0]
-    )
-
-    best_score = float(
-        similarities[best_index]
-    )
-
-    best_sentence = unique_sentences[
-        best_index
-    ]
-
-
-    # --------------------------------------------------
-    # SPECIAL HANDLING FOR COMPLEXITY QUESTIONS
-    # --------------------------------------------------
-
-    query_lower = query.lower()
-
-    if (
-        "complexity" in query_lower
-        or "big o" in query_lower
-        or "big-o" in query_lower
-    ):
-
-        complexity_pattern = re.compile(
-            r"O\s*\(\s*[^)]+\s*\)",
-            re.IGNORECASE
+        return (
+            complexity_answer,
+            1.0
         )
 
-        query_words = set(
-            re.findall(
-                r"\b[a-zA-Z]+\b",
-                query_lower
-            )
-        )
+    # Otherwise use semantic passage selection
+    answer, score = find_general_answer(
+        query,
+        retrieved_chunks,
+        embedding_model
+    )
 
-        candidates = []
-
-        for sentence in unique_sentences:
-
-            complexities = complexity_pattern.findall(
-                sentence
-            )
-
-            if not complexities:
-                continue
-
-            sentence_words = set(
-                re.findall(
-                    r"\b[a-zA-Z]+\b",
-                    sentence.lower()
-                )
-            )
-
-            overlap = len(
-                query_words & sentence_words
-            )
-
-            candidates.append(
-                (
-                    overlap,
-                    sentence
-                )
-            )
-
-
-        if candidates:
-
-            candidates.sort(
-                key=lambda item: item[0],
-                reverse=True
-            )
-
-            complexity_sentence = candidates[0][1]
-
-            return (
-                complexity_sentence,
-                best_score
-            )
-
-
-    # --------------------------------------------------
-    # NORMAL ANSWER
-    # --------------------------------------------------
-
-    return best_sentence, best_score
+    return answer, score
 
 
 # --------------------------------------------------
@@ -501,34 +583,28 @@ if uploaded_file:
 
             embedding_model, reranker = load_models()
 
-
         if not chunks:
 
             st.error(
                 "No readable text was found in this PDF. "
-                "The PDF may contain scanned images instead of text."
+                "The PDF may be scanned or image-only."
             )
 
             st.stop()
-
 
         st.success(
             f"Ready! Extracted {len(chunks)} chunks."
         )
 
-
     except Exception as error:
 
         st.error(
-            f"Something went wrong while processing the PDF: {error}"
+            f"Something went wrong while processing "
+            f"the PDF: {error}"
         )
 
         st.stop()
 
-
-    # --------------------------------------------------
-    # QUESTION
-    # --------------------------------------------------
 
     query = st.text_input(
         "Ask a question about the PDF:"
@@ -543,7 +619,7 @@ if uploaded_file:
                 "Searching the document..."
             ):
 
-                retrieved_chunks, rerank_scores = retrieve_chunks(
+                retrieved_chunks = retrieve_chunks(
                     query,
                     chunks,
                     embeddings,
@@ -552,7 +628,6 @@ if uploaded_file:
                     reranker
                 )
 
-
                 answer, confidence = create_answer(
                     query,
                     retrieved_chunks,
@@ -560,9 +635,7 @@ if uploaded_file:
                 )
 
 
-            st.subheader(
-                "Answer"
-            )
+            st.subheader("Answer")
 
 
             if (
@@ -577,9 +650,7 @@ if uploaded_file:
 
             else:
 
-                st.write(
-                    answer
-                )
+                st.write(answer)
 
 
             st.caption(
@@ -604,9 +675,7 @@ if uploaded_file:
                         f"**Source {number}**"
                     )
 
-                    st.write(
-                        chunk
-                    )
+                    st.write(chunk)
 
                     if number < min(
                         3,
@@ -619,5 +688,6 @@ if uploaded_file:
         except Exception as error:
 
             st.error(
-                f"Something went wrong while answering: {error}"
+                f"Something went wrong while answering: "
+                f"{error}"
             )
