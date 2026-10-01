@@ -1,6 +1,6 @@
 streamlit
 pypdf
 numpy
-sentence-transformers
+sentence-transformers==3.0.1
 rank-bm25
-transformers
+transformers==4.44.2
