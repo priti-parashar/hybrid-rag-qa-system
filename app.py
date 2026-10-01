@@ -4,16 +4,13 @@ import re
 import numpy as np
 import pypdf
 import streamlit as st
+from google import genai
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer, util
-from transformers import (
-    AutoModelForQuestionAnswering,
-    AutoTokenizer,
-)
 
 
 # --------------------------------------------------
-# PAGE
+# PAGE CONFIG
 # --------------------------------------------------
 
 st.set_page_config(
@@ -23,12 +20,12 @@ st.set_page_config(
 
 st.title("📄 Hybrid RAG PDF Q&A")
 st.caption(
-    "Semantic Search + BM25 + CrossEncoder + Extractive QA"
+    "Semantic Search + BM25 + CrossEncoder Reranking + Gemini"
 )
 
 
 # --------------------------------------------------
-# LOAD MODELS
+# LOAD RETRIEVAL MODELS
 # --------------------------------------------------
 
 @st.cache_resource
@@ -42,31 +39,25 @@ def load_models():
         "cross-encoder/ms-marco-MiniLM-L-6-v2"
     )
 
-    qa_model_name = (
-        "distilbert/"
-        "distilbert-base-uncased-distilled-squad"
-    )
+    return embedding_model, reranker
 
-    qa_tokenizer = AutoTokenizer.from_pretrained(
-        qa_model_name
-    )
 
-    qa_model = AutoModelForQuestionAnswering.from_pretrained(
-        qa_model_name
-    )
+# --------------------------------------------------
+# GEMINI CLIENT
+# --------------------------------------------------
 
-    qa_model.eval()
+@st.cache_resource
+def get_gemini_client():
 
-    return (
-        embedding_model,
-        reranker,
-        qa_tokenizer,
-        qa_model,
+    api_key = st.secrets["GEMINI_API_KEY"]
+
+    return genai.Client(
+        api_key=api_key
     )
 
 
 # --------------------------------------------------
-# CLEAN PDF TEXT
+# CLEAN TEXT
 # --------------------------------------------------
 
 def clean_text(text):
@@ -89,13 +80,13 @@ def clean_text(text):
 
 
 # --------------------------------------------------
-# CHUNKING
+# CHUNK TEXT
 # --------------------------------------------------
 
 def chunk_text(
     text,
-    words_per_chunk=140,
-    overlap=35,
+    words_per_chunk=160,
+    overlap=40,
 ):
 
     words = text.split()
@@ -156,25 +147,16 @@ def process_pdf(file_bytes):
         if page_text:
             pages.append(page_text)
 
-    full_text = "\n\n".join(pages)
+    text = "\n\n".join(pages)
 
-    full_text = clean_text(
-        full_text
-    )
+    text = clean_text(text)
 
-    chunks = chunk_text(
-        full_text
-    )
+    chunks = chunk_text(text)
 
     if not chunks:
         return [], np.array([]), None
 
-    (
-        embedding_model,
-        _,
-        _,
-        _,
-    ) = load_models()
+    embedding_model, _ = load_models()
 
     embeddings = embedding_model.encode(
         chunks,
@@ -194,11 +176,7 @@ def process_pdf(file_bytes):
         tokenized_chunks
     )
 
-    return (
-        chunks,
-        embeddings,
-        bm25,
-    )
+    return chunks, embeddings, bm25
 
 
 # --------------------------------------------------
@@ -239,10 +217,10 @@ def retrieve_chunks(
     bm25,
     embedding_model,
     reranker,
-    top_k=5,
+    top_k=4,
 ):
 
-    # Semantic search
+    # Semantic retrieval
     query_embedding = embedding_model.encode(
         query,
         convert_to_numpy=True,
@@ -254,7 +232,7 @@ def retrieve_chunks(
         embeddings,
     )[0].cpu().numpy()
 
-    # BM25 keyword search
+    # BM25 retrieval
     query_tokens = re.findall(
         r"\b\w+\b",
         query.lower(),
@@ -266,18 +244,18 @@ def retrieve_chunks(
         )
     )
 
-    semantic_scores = normalize_scores(
+    semantic_normalized = normalize_scores(
         semantic_scores
     )
 
-    bm25_scores = normalize_scores(
+    bm25_normalized = normalize_scores(
         bm25_scores
     )
 
-    # Hybrid retrieval
+    # Hybrid score
     hybrid_scores = (
-        0.6 * semantic_scores
-        + 0.4 * bm25_scores
+        0.6 * semantic_normalized
+        + 0.4 * bm25_normalized
     )
 
     candidate_count = min(
@@ -299,9 +277,7 @@ def retrieve_chunks(
     ]
 
     rerank_scores = np.asarray(
-        reranker.predict(
-            pairs
-        )
+        reranker.predict(pairs)
     )
 
     reranked_positions = np.argsort(
@@ -323,161 +299,98 @@ def retrieve_chunks(
 
 
 # --------------------------------------------------
-# EXTRACT ANSWER FROM ONE CHUNK
+# BUILD CONTEXT
 # --------------------------------------------------
 
-def answer_from_chunk(
-    question,
-    context,
-    tokenizer,
-    model,
-):
-
-    import torch
-
-    inputs = tokenizer(
-        question,
-        context,
-        return_tensors="pt",
-        truncation="only_second",
-        max_length=512,
-    )
-
-    with torch.no_grad():
-
-        outputs = model(
-            **inputs
-        )
-
-    start_logits = (
-        outputs.start_logits[0]
-    )
-
-    end_logits = (
-        outputs.end_logits[0]
-    )
-
-    sequence_ids = inputs.sequence_ids(
-        0
-    )
-
-    context_positions = [
-        index
-        for index, sequence_id
-        in enumerate(sequence_ids)
-        if sequence_id == 1
-    ]
-
-    if not context_positions:
-        return "", 0.0
-
-    best_answer = ""
-    best_score = float("-inf")
-
-    # Search possible answer spans only
-    # inside the document context.
-    for start_index in context_positions:
-
-        max_end = min(
-            start_index + 30,
-            context_positions[-1] + 1,
-        )
-
-        for end_index in range(
-            start_index,
-            max_end,
-        ):
-
-            if sequence_ids[
-                end_index
-            ] != 1:
-                continue
-
-            score = float(
-                start_logits[start_index]
-                + end_logits[end_index]
-            )
-
-            if score > best_score:
-
-                token_ids = inputs[
-                    "input_ids"
-                ][0][
-                    start_index:
-                    end_index + 1
-                ]
-
-                answer = tokenizer.decode(
-                    token_ids,
-                    skip_special_tokens=True,
-                ).strip()
-
-                if answer:
-
-                    best_score = score
-                    best_answer = answer
-
-    return (
-        best_answer,
-        best_score,
-    )
-
-
-# --------------------------------------------------
-# FIND BEST ANSWER ACROSS RETRIEVED CHUNKS
-# --------------------------------------------------
-
-def find_best_answer(
-    question,
+def build_context(
     retrieved_chunks,
-    tokenizer,
-    model,
+    max_characters=6000,
 ):
 
-    answers = []
+    selected_chunks = []
+    total_length = 0
 
     for chunk in retrieved_chunks:
 
-        answer, score = answer_from_chunk(
-            question,
-            chunk,
-            tokenizer,
-            model,
+        remaining = (
+            max_characters
+            - total_length
         )
 
-        if answer:
+        if remaining <= 0:
+            break
 
-            answers.append(
-                (
-                    answer,
-                    score,
-                    chunk,
-                )
-            )
+        selected_chunk = chunk[:remaining]
 
-    if not answers:
-
-        return (
-            None,
-            None,
+        selected_chunks.append(
+            selected_chunk
         )
 
-    answers.sort(
-        key=lambda item: item[1],
-        reverse=True,
-    )
+        total_length += len(
+            selected_chunk
+        )
 
-    best_answer = answers[0][0]
-    best_source = answers[0][2]
-
-    return (
-        best_answer,
-        best_source,
+    return "\n\n---\n\n".join(
+        selected_chunks
     )
 
 
 # --------------------------------------------------
-# USER INTERFACE
+# GENERATE GROUNDED ANSWER
+# --------------------------------------------------
+
+def generate_answer(
+    question,
+    retrieved_chunks,
+):
+
+    client = get_gemini_client()
+
+    context = build_context(
+        retrieved_chunks
+    )
+
+    prompt = f"""
+You are answering a question about an uploaded document.
+
+Use ONLY the document context provided below.
+
+Rules:
+- Answer the user's exact question.
+- Do not use outside knowledge.
+- Do not invent facts.
+- Combine relevant information from the context when necessary.
+- Give a clear, natural and concise answer.
+- Do not simply copy an unrelated sentence from the context.
+- If the context genuinely does not contain enough information to
+  answer the question, reply exactly:
+  "I couldn't find enough information in the document."
+
+DOCUMENT CONTEXT:
+{context}
+
+USER QUESTION:
+{question}
+
+ANSWER:
+""".strip()
+
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt,
+    )
+
+    if not response.text:
+        return (
+            "I couldn't find enough information "
+            "in the document."
+        )
+
+    return response.text.strip()
+
+
+# --------------------------------------------------
+# STREAMLIT UI
 # --------------------------------------------------
 
 uploaded_file = st.file_uploader(
@@ -490,9 +403,7 @@ if uploaded_file is not None:
 
     try:
 
-        file_bytes = (
-            uploaded_file.getvalue()
-        )
+        file_bytes = uploaded_file.getvalue()
 
         with st.spinner(
             "Processing PDF..."
@@ -509,30 +420,26 @@ if uploaded_file is not None:
             (
                 embedding_model,
                 reranker,
-                qa_tokenizer,
-                qa_model,
             ) = load_models()
 
         if not chunks:
 
             st.error(
-                "No readable text was found "
-                "in this PDF. It may be "
-                "scanned or image-only."
+                "No readable text was found in this PDF. "
+                "It may be scanned or image-only."
             )
 
             st.stop()
 
         st.success(
-            f"Ready! Extracted "
-            f"{len(chunks)} chunks."
+            f"Ready! Extracted {len(chunks)} chunks."
         )
 
     except Exception as error:
 
         st.error(
-            "Something went wrong while "
-            f"processing the PDF: {error}"
+            "Something went wrong while processing "
+            f"the PDF: {error}"
         )
 
         st.stop()
@@ -560,76 +467,49 @@ if uploaded_file is not None:
                     reranker,
                 )
 
-                (
-                    answer,
-                    answer_source,
-                ) = find_best_answer(
+                answer = generate_answer(
                     question,
                     retrieved_chunks,
-                    qa_tokenizer,
-                    qa_model,
                 )
 
 
-            st.subheader(
-                "Answer"
-            )
+            # --------------------------------------
+            # ANSWER
+            # --------------------------------------
 
-            if answer:
+            st.subheader("Answer")
 
-                st.write(
-                    answer
-                )
+            st.write(answer)
 
-            else:
 
-                st.warning(
-                    "I couldn't find a reliable "
-                    "answer in the document."
-                )
-
+            # --------------------------------------
+            # SOURCES
+            # --------------------------------------
 
             with st.expander(
                 "Show source context"
             ):
 
-                if answer_source:
-
-                    st.markdown(
-                        "**Answer source**"
-                    )
-
-                    st.write(
-                        answer_source
-                    )
-
-                    st.divider()
-
                 for number, chunk in enumerate(
-                    retrieved_chunks[:3],
+                    retrieved_chunks,
                     start=1,
                 ):
 
                     st.markdown(
-                        f"**Retrieved source "
-                        f"{number}**"
+                        f"**Source {number}**"
                     )
 
-                    st.write(
-                        chunk
-                    )
+                    st.write(chunk)
 
-                    if number < min(
-                        3,
-                        len(retrieved_chunks),
+                    if number < len(
+                        retrieved_chunks
                     ):
-
                         st.divider()
 
 
         except Exception as error:
 
             st.error(
-                "Something went wrong while "
-                f"answering: {error}"
+                "Something went wrong while answering. "
+                f"Details: {error}"
             )
