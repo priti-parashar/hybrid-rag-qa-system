@@ -5,11 +5,10 @@ import numpy as np
 
 from sentence_transformers import SentenceTransformer, util, CrossEncoder
 from rank_bm25 import BM25Okapi
-from transformers import pipeline
 
 
 # --------------------------------------------------
-# PAGE CONFIGURATION
+# PAGE CONFIG
 # --------------------------------------------------
 
 st.set_page_config(
@@ -17,10 +16,10 @@ st.set_page_config(
     page_icon="📄"
 )
 
-st.title("📄 Ask Your PDF")
-st.caption("Hybrid RAG: Semantic Search + BM25 + CrossEncoder Reranking")
-
-CONFIDENCE_THRESHOLD = 0.1
+st.title("📄 Hybrid RAG PDF Q&A")
+st.caption(
+    "Semantic Search + BM25 + CrossEncoder Reranking"
+)
 
 
 # --------------------------------------------------
@@ -30,98 +29,71 @@ CONFIDENCE_THRESHOLD = 0.1
 @st.cache_resource
 def load_models():
 
-    # Embedding model for semantic search
-    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embedding_model = SentenceTransformer(
+        "all-MiniLM-L6-v2"
+    )
 
-    # CrossEncoder for reranking retrieved chunks
     reranker = CrossEncoder(
         "cross-encoder/ms-marco-MiniLM-L-6-v2"
     )
 
-    # Extractive question-answering model
-    qa = pipeline(
-        "question-answering",
-        model="deepset/roberta-base-squad2",
-        tokenizer="deepset/roberta-base-squad2"
-    )
-
-    return model, reranker, qa
+    return embedding_model, reranker
 
 
 # --------------------------------------------------
-# DEFINITION-BASED CHUNKING
+# TEXT CLEANING
 # --------------------------------------------------
 
-def chunk_by_definition(text):
+def clean_text(text):
 
-    pattern = re.compile(
-        r'([A-Za-z0-9_@\.\*\(\)\s/]{2,60})\n'
-        r'Definition:\s*(.*?)\n'
-        r'Example:\n'
-        r'(.*?)'
-        r'(?=\n[A-Za-z0-9_@\.\*\(\)\s/]{2,60}\nDefinition:|\Z)',
-        re.DOTALL
-    )
+    text = text.replace("\x00", " ")
 
-    chunks = []
-
-    for term, definition, example in pattern.findall(text):
-
-        chunk = (
-            f"{term.strip()}\n"
-            f"Definition: {definition.strip()}\n"
-            f"Example:\n{example.strip()}"
-        )
-
-        chunks.append(chunk)
-
-    return chunks
-
-
-# --------------------------------------------------
-# GENERAL SENTENCE CHUNKING
-# --------------------------------------------------
-
-def chunk_by_sentences(
-    text,
-    sentences_per_chunk=3,
-    overlap=1
-):
-
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    sentences = re.split(
-        r'(?<=[.!?])\s+',
+    text = re.sub(
+        r"[ \t]+",
+        " ",
         text
     )
 
-    sentences = [
-        sentence.strip()
-        for sentence in sentences
-        if sentence.strip()
-    ]
+    text = re.sub(
+        r"\n{3,}",
+        "\n\n",
+        text
+    )
+
+    return text.strip()
+
+
+# --------------------------------------------------
+# CHUNKING
+# --------------------------------------------------
+
+def chunk_text(text, words_per_chunk=180, overlap=40):
+
+    words = text.split()
 
     chunks = []
 
-    i = 0
+    if not words:
+        return chunks
 
-    step = max(
-        1,
-        sentences_per_chunk - overlap
-    )
+    step = words_per_chunk - overlap
 
-    while i < len(sentences):
+    for start in range(0, len(words), step):
 
-        chunk_sentences = sentences[
-            i:i + sentences_per_chunk
+        chunk_words = words[
+            start:start + words_per_chunk
         ]
 
-        if chunk_sentences:
-            chunks.append(
-                " ".join(chunk_sentences)
-            )
+        if not chunk_words:
+            continue
 
-        i += step
+        chunk = " ".join(chunk_words).strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        if start + words_per_chunk >= len(words):
+            break
 
     return chunks
 
@@ -135,215 +107,383 @@ def process_pdf(file_bytes):
 
     pdf = pypdf.PdfReader(file_bytes)
 
-    text = ""
+    pages = []
 
     for page in pdf.pages:
 
         page_text = page.extract_text()
 
         if page_text:
-            text += page_text + "\n"
+            pages.append(page_text)
 
-    # First try definition-based chunking
-    chunks = chunk_by_definition(text)
+    text = "\n\n".join(pages)
 
-    used_fallback = False
+    text = clean_text(text)
 
-    # If the document does not follow the
-    # Definition / Example structure,
-    # use general sentence chunking.
-    if not chunks:
-
-        chunks = chunk_by_sentences(text)
-
-        used_fallback = True
+    chunks = chunk_text(text)
 
     if not chunks:
-        return [], np.array([]), None, used_fallback
 
-    # Generate semantic embeddings
-    model, _, _ = load_models()
+        return [], np.array([]), None
 
-    embeddings = model.encode(
+    embedding_model, _ = load_models()
+
+    embeddings = embedding_model.encode(
         chunks,
-        convert_to_numpy=True
+        convert_to_numpy=True,
+        normalize_embeddings=True
     )
 
-    # Prepare chunks for BM25
     tokenized_chunks = [
+
         re.findall(
-            r'\w+\b',
+            r"\b\w+\b",
             chunk.lower()
         )
+
         for chunk in chunks
     ]
 
-    bm25 = BM25Okapi(tokenized_chunks)
+    bm25 = BM25Okapi(
+        tokenized_chunks
+    )
+
+    return chunks, embeddings, bm25
+
+
+# --------------------------------------------------
+# NORMALIZATION
+# --------------------------------------------------
+
+def normalize_scores(scores):
+
+    scores = np.asarray(
+        scores,
+        dtype=float
+    )
+
+    score_min = scores.min()
+    score_max = scores.max()
+
+    if score_max == score_min:
+
+        return np.zeros_like(
+            scores,
+            dtype=float
+        )
 
     return (
-        chunks,
-        embeddings,
-        bm25,
-        used_fallback
+        scores - score_min
+    ) / (
+        score_max - score_min
     )
 
 
 # --------------------------------------------------
-# HYBRID RETRIEVAL + RERANKING + QA
+# HYBRID RETRIEVAL
 # --------------------------------------------------
 
-def answer_question(
+def retrieve_chunks(
     query,
     chunks,
     embeddings,
     bm25,
-    model,
+    embedding_model,
     reranker,
-    qa
+    top_k=5
 ):
 
-    # ---------------------------
-    # 1. SEMANTIC SEARCH
-    # ---------------------------
-
-    query_embedding = model.encode(query)
-
-    scores = util.cos_sim(
-        query_embedding,
-        embeddings
-    ).squeeze(0)
-
-    semantic_scores = (
-        scores.cpu()
-        .numpy()
-        .flatten()
+    # Semantic retrieval
+    query_embedding = embedding_model.encode(
+        query,
+        convert_to_numpy=True,
+        normalize_embeddings=True
     )
 
-    # ---------------------------
-    # 2. BM25 SEARCH
-    # ---------------------------
+    semantic_scores = util.cos_sim(
+        query_embedding,
+        embeddings
+    )[0].cpu().numpy()
 
+
+    # BM25 retrieval
     query_tokens = re.findall(
-        r'\w+\b',
+        r"\b\w+\b",
         query.lower()
     )
 
-    bm25_scores = np.array(
+    bm25_scores = np.asarray(
         bm25.get_scores(query_tokens)
     )
 
-    # ---------------------------
-    # 3. NORMALIZE SCORES
-    # ---------------------------
 
-    semantic_range = (
-        semantic_scores.max()
-        - semantic_scores.min()
+    # Normalize both score types
+    semantic_normalized = normalize_scores(
+        semantic_scores
     )
 
-    if semantic_range == 0:
-
-        semantic_normalized = np.zeros_like(
-            semantic_scores
-        )
-
-    else:
-
-        semantic_normalized = (
-            semantic_scores
-            - semantic_scores.min()
-        ) / semantic_range
-
-    bm25_range = (
-        bm25_scores.max()
-        - bm25_scores.min()
+    bm25_normalized = normalize_scores(
+        bm25_scores
     )
 
-    if bm25_range == 0:
 
-        bm25_normalized = np.zeros_like(
-            bm25_scores
-        )
-
-    else:
-
-        bm25_normalized = (
-            bm25_scores
-            - bm25_scores.min()
-        ) / bm25_range
-
-    # ---------------------------
-    # 4. HYBRID SCORE
-    # ---------------------------
-
+    # Hybrid score
     hybrid_scores = (
-        0.5 * semantic_normalized
-        + 0.5 * bm25_normalized
+        0.6 * semantic_normalized
+        + 0.4 * bm25_normalized
     )
 
-    # Retrieve top 5 candidate chunks
-    top_indices = (
+
+    candidate_count = min(
+        10,
+        len(chunks)
+    )
+
+    candidate_indices = np.argsort(
         hybrid_scores
-        .argsort()[-5:][::-1]
-    )
+    )[-candidate_count:][::-1]
 
-    # ---------------------------
-    # 5. CROSSENCODER RERANKING
-    # ---------------------------
 
+    # CrossEncoder reranking
     pairs = [
+
         (
             query,
             chunks[int(index)]
         )
-        for index in top_indices
+
+        for index in candidate_indices
     ]
 
-    rerank_scores = reranker.predict(pairs)
+    rerank_scores = np.asarray(
+        reranker.predict(pairs)
+    )
 
-    ranked_positions = np.argsort(
+    reranked_positions = np.argsort(
         rerank_scores
     )[::-1]
 
-    # ---------------------------
-    # 6. USE TOP 3 CHUNKS
-    # ---------------------------
 
-    best_indices = [
-        int(top_indices[position])
-        for position in ranked_positions[:3]
+    final_indices = [
+
+        int(
+            candidate_indices[position]
+        )
+
+        for position in reranked_positions[:top_k]
     ]
 
-    selected_chunks = [
+
+    final_chunks = [
+
         chunks[index]
-        for index in best_indices
+
+        for index in final_indices
     ]
 
-    # Combine the best chunks
-    context = "\n\n".join(
-        selected_chunks
-    )
 
-    # ---------------------------
-    # 7. QUESTION ANSWERING
-    # ---------------------------
+    final_scores = [
 
-    result = qa(
-        question=query,
-        context=context,
-        max_answer_len=100
-    )
+        float(
+            rerank_scores[position]
+        )
 
-    return result, context
+        for position in reranked_positions[:top_k]
+    ]
+
+
+    return final_chunks, final_scores
 
 
 # --------------------------------------------------
-# STREAMLIT USER INTERFACE
+# SENTENCE EXTRACTION
+# --------------------------------------------------
+
+def split_into_sentences(text):
+
+    # Split normal sentences while also handling
+    # PDF text that contains headings or short lines.
+    sentences = re.split(
+        r"(?<=[.!?])\s+|\n+",
+        text
+    )
+
+    return [
+
+        sentence.strip()
+
+        for sentence in sentences
+
+        if sentence.strip()
+    ]
+
+
+# --------------------------------------------------
+# CREATE ANSWER FROM RETRIEVED CONTEXT
+# --------------------------------------------------
+
+def create_answer(
+    query,
+    retrieved_chunks,
+    embedding_model
+):
+
+    sentences = []
+
+    for chunk in retrieved_chunks:
+
+        sentences.extend(
+            split_into_sentences(chunk)
+        )
+
+
+    # Remove duplicate sentences
+    unique_sentences = []
+
+    seen = set()
+
+    for sentence in sentences:
+
+        normalized = sentence.lower().strip()
+
+        if (
+            normalized
+            and normalized not in seen
+        ):
+
+            seen.add(normalized)
+
+            unique_sentences.append(
+                sentence
+            )
+
+
+    if not unique_sentences:
+
+        return None, 0.0
+
+
+    # Compare the question directly with
+    # sentences in the retrieved context.
+    query_embedding = embedding_model.encode(
+        query,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+
+    sentence_embeddings = embedding_model.encode(
+        unique_sentences,
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )
+
+    similarities = util.cos_sim(
+        query_embedding,
+        sentence_embeddings
+    )[0].cpu().numpy()
+
+
+    best_indices = np.argsort(
+        similarities
+    )[::-1]
+
+
+    best_index = int(
+        best_indices[0]
+    )
+
+    best_score = float(
+        similarities[best_index]
+    )
+
+    best_sentence = unique_sentences[
+        best_index
+    ]
+
+
+    # --------------------------------------------------
+    # SPECIAL HANDLING FOR COMPLEXITY QUESTIONS
+    # --------------------------------------------------
+
+    query_lower = query.lower()
+
+    if (
+        "complexity" in query_lower
+        or "big o" in query_lower
+        or "big-o" in query_lower
+    ):
+
+        complexity_pattern = re.compile(
+            r"O\s*\(\s*[^)]+\s*\)",
+            re.IGNORECASE
+        )
+
+        query_words = set(
+            re.findall(
+                r"\b[a-zA-Z]+\b",
+                query_lower
+            )
+        )
+
+        candidates = []
+
+        for sentence in unique_sentences:
+
+            complexities = complexity_pattern.findall(
+                sentence
+            )
+
+            if not complexities:
+                continue
+
+            sentence_words = set(
+                re.findall(
+                    r"\b[a-zA-Z]+\b",
+                    sentence.lower()
+                )
+            )
+
+            overlap = len(
+                query_words & sentence_words
+            )
+
+            candidates.append(
+                (
+                    overlap,
+                    sentence
+                )
+            )
+
+
+        if candidates:
+
+            candidates.sort(
+                key=lambda item: item[0],
+                reverse=True
+            )
+
+            complexity_sentence = candidates[0][1]
+
+            return (
+                complexity_sentence,
+                best_score
+            )
+
+
+    # --------------------------------------------------
+    # NORMAL ANSWER
+    # --------------------------------------------------
+
+    return best_sentence, best_score
+
+
+# --------------------------------------------------
+# STREAMLIT UI
 # --------------------------------------------------
 
 uploaded_file = st.file_uploader(
     "Upload a PDF",
-    type="pdf"
+    type=["pdf"]
 )
 
 
@@ -355,46 +495,39 @@ if uploaded_file:
             "Processing PDF..."
         ):
 
-            chunks, embeddings, bm25, used_fallback = (
-                process_pdf(uploaded_file)
+            chunks, embeddings, bm25 = process_pdf(
+                uploaded_file
             )
 
-            model, reranker, qa = load_models()
+            embedding_model, reranker = load_models()
+
 
         if not chunks:
 
             st.error(
-                "Couldn't extract readable text from this PDF. "
-                "It may be scanned or image-only."
+                "No readable text was found in this PDF. "
+                "The PDF may contain scanned images instead of text."
             )
 
             st.stop()
 
-    except Exception as e:
+
+        st.success(
+            f"Ready! Extracted {len(chunks)} chunks."
+        )
+
+
+    except Exception as error:
 
         st.error(
-            f"Something went wrong processing this PDF: {e}"
+            f"Something went wrong while processing the PDF: {error}"
         )
 
         st.stop()
 
 
-    # PDF successfully processed
-    st.success(
-        f"Ready! Extracted {len(chunks)} chunks."
-    )
-
-
-    if used_fallback:
-
-        st.caption(
-            "Using general-purpose sentence-based "
-            "chunking for this document."
-        )
-
-
     # --------------------------------------------------
-    # QUESTION INPUT
+    # QUESTION
     # --------------------------------------------------
 
     query = st.text_input(
@@ -410,57 +543,81 @@ if uploaded_file:
                 "Searching the document..."
             ):
 
-                result, context = answer_question(
+                retrieved_chunks, rerank_scores = retrieve_chunks(
                     query,
                     chunks,
                     embeddings,
                     bm25,
-                    model,
-                    reranker,
-                    qa
+                    embedding_model,
+                    reranker
                 )
 
-            # ------------------------------------------
-            # DISPLAY ANSWER
-            # ------------------------------------------
 
-            st.subheader("Answer")
+                answer, confidence = create_answer(
+                    query,
+                    retrieved_chunks,
+                    embedding_model
+                )
 
 
-            if result["score"] < CONFIDENCE_THRESHOLD:
+            st.subheader(
+                "Answer"
+            )
+
+
+            if (
+                answer is None
+                or confidence < 0.20
+            ):
 
                 st.warning(
-                    "I'm not confident enough to answer "
-                    "this from the document. Try rephrasing "
-                    "your question."
+                    "I couldn't find a reliable answer "
+                    "to this question in the document."
                 )
 
             else:
 
                 st.write(
-                    result["answer"]
+                    answer
                 )
 
 
-            # Confidence score
             st.caption(
-                f"Confidence: {result['score']:.3f}"
+                f"Answer relevance: {confidence:.3f}"
             )
 
 
-            # ------------------------------------------
+            # --------------------------------------------------
             # SOURCE CONTEXT
-            # ------------------------------------------
+            # --------------------------------------------------
 
             with st.expander(
                 "Show source context"
             ):
 
-                st.text(context)
+                for number, chunk in enumerate(
+                    retrieved_chunks[:3],
+                    start=1
+                ):
+
+                    st.markdown(
+                        f"**Source {number}**"
+                    )
+
+                    st.write(
+                        chunk
+                    )
+
+                    if number < min(
+                        3,
+                        len(retrieved_chunks)
+                    ):
+
+                        st.divider()
 
 
-        except Exception as e:
+        except Exception as error:
 
             st.error(
-                f"Something went wrong while answering: {e}"
+                f"Something went wrong while answering: {error}"
             )
